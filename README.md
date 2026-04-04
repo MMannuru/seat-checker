@@ -1,4 +1,4 @@
-# SeatChecker — Developer Instructions
+# SeatChecker 
 
 ## Project Overview
 
