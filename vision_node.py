@@ -1,111 +1,127 @@
 import cv2
 import requests
 import time
-import logging
+from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [VISION] %(message)s",
-    datefmt="%H:%M:%S"
-)
+# MODEL LOADING
+BASE_DIR = Path(__file__).resolve().parent
+prototxt = str(BASE_DIR / "models" / "MobileNetSSD_deploy.prototxt")
 
-SEAT_ID = "desk1"
-SERVER_URL = "http://127.0.0.1:5000/seat_status"
-CAMERA_INDEX = 0
-MIN_CONTOUR_AREA = 3000
-STABILITY_FRAMES = 8
-POST_COOLDOWN = 2.0
-BLUR_KERNEL = (21, 21)
+MODEL_CANDIDATES = [
+    BASE_DIR / "models" / "MobileNetSSD_deploy.caffemodel",
+    BASE_DIR / "models" / "mobilenet_iter_73000.caffemodel",
+]
+
+def load_net():
+    last_error = None
+    for model_path in MODEL_CANDIDATES:
+        if not model_path.exists():
+            continue
+        try:
+            net = cv2.dnn.readNetFromCaffe(prototxt, str(model_path))
+
+            # warmup
+            warmup = cv2.dnn.blobFromImage(
+                cv2.UMat(300, 300, cv2.CV_8UC3).get(),
+                0.007843,
+                (300, 300),
+                127.5
+            )
+            net.setInput(warmup)
+            net.forward()
+
+            print(f"[INFO] Loaded model: {model_path.name}")
+            return net
+        except cv2.error as e:
+            last_error = e
+
+    raise RuntimeError("No compatible model found.") from last_error
 
 
-def post_status(status: str) -> bool:
-    payload = {"seat_id": SEAT_ID, "status": status}
-    try:
-        resp = requests.post(SERVER_URL, json=payload, timeout=3)
-        resp.raise_for_status()
-        logging.info(f"POST -> {status.upper()}  (HTTP {resp.status_code})")
-        return True
-    except requests.exceptions.ConnectionError:
-        logging.warning("Server unreachable — is app.py running?")
-    except requests.exceptions.RequestException as e:
-        logging.warning(f"POST failed: {e}")
-    return False
+net = load_net()
 
+CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
+           "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
+           "dog", "horse", "motorbike", "person", "pottedplant",
+           "sheep", "sofa", "train", "tvmonitor"]
 
-def run_vision_node():
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        logging.error(f"Cannot open camera index {CAMERA_INDEX}.")
-        return
+CONF_THRESHOLD = 0.5
+HISTORY_SIZE = 10
+API_URL = "http://127.0.0.1:5000/update_status"
 
-    logging.info("Camera opened. Starting occupancy detection — press Q to quit.")
+history = []
+last_sent_status = None
 
-    subtractor = cv2.createBackgroundSubtractorMOG2(
-        history=500,
-        varThreshold=50,
-        detectShadows=True
+cap = cv2.VideoCapture(0)
+
+print("[INFO] Vision node started. Press 'q' to quit.")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    (h, w) = frame.shape[:2]
+
+    # Run detection
+    blob = cv2.dnn.blobFromImage(frame, 0.007843, (300, 300), 127.5)
+    net.setInput(blob)
+    detections = net.forward()
+
+    current_detected = False
+
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+
+        if confidence > CONF_THRESHOLD:
+            idx = int(detections[0, 0, i, 1])
+            label = CLASSES[idx]
+
+            if label == "person":
+                current_detected = True
+
+                box = detections[0, 0, i, 3:7] * [w, h, w, h]
+                (startX, startY, endX, endY) = box.astype("int")
+
+                cv2.rectangle(frame, (startX, startY), (endX, endY),
+                              (0, 255, 0), 2)
+                cv2.putText(frame, "PERSON", (startX, startY - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # Smooth detection over time
+    history.append(1 if current_detected else 0)
+    if len(history) > HISTORY_SIZE:
+        history.pop(0)
+
+    occupied = sum(history) > (HISTORY_SIZE // 2)
+    status = "occupied" if occupied else "vacant"
+
+    if status != last_sent_status:
+        try:
+            print(f"[VISION] Sending status={status}")
+            requests.post(API_URL, json={"status": status}, timeout=1)
+        except Exception as e:
+            print("[WARN] API send failed:", e)
+
+        last_sent_status = status
+
+    # Display UI
+    cv2.putText(
+        frame,
+        f"Status: {status.upper()}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 0) if occupied else (0, 0, 255),
+        2
     )
 
-    current_status = None
-    candidate_status = None
-    stable_count = 0
-    last_post_time = 0.0
+    cv2.imshow("Seat Monitor", frame)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            logging.warning("Empty frame received — camera may have disconnected.")
-            time.sleep(0.1)
-            continue
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
 
-        blurred = cv2.GaussianBlur(frame, BLUR_KERNEL, 0)
-        fg_mask = subtractor.apply(blurred)
-        _, fg_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+    time.sleep(0.2)
 
-        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        significant = [c for c in contours if cv2.contourArea(c) > MIN_CONTOUR_AREA]
-        raw_status = "occupied" if significant else "vacant"
-
-        if raw_status == candidate_status:
-            stable_count += 1
-        else:
-            candidate_status = raw_status
-            stable_count = 1
-
-        committed = stable_count >= STABILITY_FRAMES
-
-        now = time.time()
-        if committed and raw_status != current_status:
-            if now - last_post_time >= POST_COOLDOWN:
-                if post_status(raw_status):
-                    current_status = raw_status
-                    last_post_time = now
-
-        display_status = current_status or "initializing..."
-        color = (0, 255, 0) if display_status == "occupied" else (0, 0, 255)
-        label = f"Status: {display_status}"
-
-        for c in significant:
-            x, y, w, h = cv2.boundingRect(c)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-
-        cv2.putText(frame, label, (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
-        cv2.putText(frame, f"Stable: {stable_count}/{STABILITY_FRAMES}", (15, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-
-        cv2.imshow("SeatChecker — Camera Feed", frame)
-        cv2.imshow("SeatChecker — Foreground Mask", fg_mask)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            logging.info("Quit signal received.")
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    logging.info("Vision node stopped.")
-
-
-if __name__ == "__main__":
-    run_vision_node()
+cap.release()
+cv2.destroyAllWindows()
